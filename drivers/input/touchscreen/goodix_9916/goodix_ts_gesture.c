@@ -34,10 +34,6 @@
 #define GSX_GESTURE_TYPE_LEN	32
 #define TYPE_B_PROTOCOL
 
-static int  FP_Event_Gesture;
-
-
-
 /*
  * struct gesture_module - gesture module data
  * @registered: module register state
@@ -51,6 +47,8 @@ struct gesture_module {
 	rwlock_t rwlock;
 	u8 gesture_type[GSX_GESTURE_TYPE_LEN];
 	u8 gesture_data;
+	unsigned int fod_slot;
+	bool gesture_active;
 	struct goodix_ext_module module;
 };
 
@@ -234,7 +232,7 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 	struct goodix_ts_hw_ops *hw_ops = cd->hw_ops;
 	struct goodix_ts_event gs_event = {0};
 	int ret;
-	int key_value;
+	int key_value = KEY_RESERVED;
 	unsigned int fodx,fody, fod_id;
 	unsigned int overlay_area;
 	u8 gesture_data[32];
@@ -257,13 +255,15 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 	}
 
 	memcpy(gesture_data,gs_event.touch_data.tmp_data,32*sizeof(u8));
-	if ((gesture_data[0] & 0x08)  != 0)
-		FP_Event_Gesture = 1;
 
 	fod_id = gesture_data[17];
-	if (cd->fod_status && (FP_Event_Gesture == 1) &&
-		(gs_event.gesture_type== 0x46) &&
-		(cd->nonui_status != 2)) {
+	if (cd->fod_status > 0 && cd->fod_status != 100 &&
+		(gesture_data[0] & 0x08) &&
+		gs_event.gesture_type == 0x46 &&
+		cd->nonui_status != 2) {
+		if (cd->fod_finger || fod_id >= GOODIX_MAX_TOUCH)
+			goto re_send_ges_cmd;
+		gsx_gesture->fod_slot = fod_id;
 		fodx = gesture_data[8] | (gesture_data[9] << 8);
 		fody = gesture_data[10] | (gesture_data[11] << 8);
 		overlay_area=gesture_data[12];
@@ -288,10 +288,10 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 			mi_disp_set_fod_queue_work(1, true);
 			update_fod_press_status(1);
 			cd->fod_finger = true;
-			FP_Event_Gesture = 0;
 			goto re_send_ges_cmd;
 	}
-	if  ( (FP_Event_Gesture == 1) && (gs_event.gesture_type== 0x55)){
+	/* Finger-up may arrive without the FOD flag set in the packet. */
+	if (gs_event.gesture_type == 0x55) {
 		if (cd->fod_finger) {
 			ts_info("fod finger is %d",cd->fod_finger);
 			ts_info("fod up");
@@ -301,7 +301,7 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 			input_report_abs(cd->input_dev, ABS_MT_WIDTH_MINOR, 0);
 			input_sync(cd->input_dev);
 #ifdef TYPE_B_PROTOCOL
-			input_mt_slot(cd->input_dev, fod_id);
+			input_mt_slot(cd->input_dev, gsx_gesture->fod_slot);
 			ts_info("fod id:%d",fod_id);
 			input_mt_report_slot_state(cd->input_dev,
 					MT_TOOL_FINGER, 0);
@@ -328,10 +328,12 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 			ts_info("GTP gesture report single tap");
 			key_value = KEY_GOTO;
 		}
-		input_report_key(cd->input_dev, key_value, 1);
-		input_sync(cd->input_dev);
-		input_report_key(cd->input_dev, key_value, 0);
-		input_sync(cd->input_dev);
+		if (key_value != KEY_RESERVED) {
+			input_report_key(cd->input_dev, key_value, 1);
+			input_sync(cd->input_dev);
+			input_report_key(cd->input_dev, key_value, 0);
+			input_sync(cd->input_dev);
+		}
 		goto re_send_ges_cmd;
 	} else {
 		ts_info("unsupported gesture:%x", gs_event.gesture_type);
@@ -362,14 +364,21 @@ static int gsx_gesture_before_suspend(struct goodix_ts_core *cd,
 	int ret;
 	const struct goodix_ts_hw_ops *hw_ops = cd->hw_ops;
 
+	gsx_gesture->gesture_active = false;
 	ret = hw_ops->gesture(cd, cd->gesture_enabled);
-	if (ret)
+	if (ret) {
 		ts_err("failed enter gesture mode");
-	else
-		ts_info("enter gesture mode");
+		return EVT_CONTINUE;
+	}
+	ts_info("enter gesture mode");
 
+	ret = enable_irq_wake(cd->irq);
+	if (ret) {
+		ts_err("failed enable gesture wake: %d", ret);
+		return EVT_CONTINUE;
+	}
+	gsx_gesture->gesture_active = true;
 	hw_ops->irq_enable(cd, true);
-	enable_irq_wake(cd->irq);
 
 	return EVT_CANCEL_SUSPEND;
 }
@@ -379,6 +388,10 @@ static int gsx_gesture_before_resume(struct goodix_ts_core *cd,
 {
 	const struct goodix_ts_hw_ops *hw_ops = cd->hw_ops;
 
+	if (!gsx_gesture->gesture_active)
+		return EVT_CONTINUE;
+
+	gsx_gesture->gesture_active = false;
 	hw_ops->irq_enable(cd, false);
 	disable_irq_wake(cd->irq);
 	hw_ops->reset(cd, GOODIX_NORMAL_RESET_DELAY_MS);
